@@ -944,7 +944,7 @@ class DQNActor(TorchActorModule):
         #     print(f"Input tensor {i + 1} shape:", input_tensor.shape)
         #     print(input_tensor)
         processed_tensor = self.process(obs)
-        print(processed_tensor.shape)
+        # print(processed_tensor.shape)
         x = self.dense(processed_tensor)
         x = x.view(-1, self.dense_output_size)
         v = self.fc_z_v(F.relu(self.fc_h_v(x), test), test)  # Value stream
@@ -1003,7 +1003,9 @@ class DQNActor(TorchActorModule):
             support_weighted = logprob * self.support
             summed = support_weighted.sum(2)
             # gives 
-            res = np.array([summed[0,:1].argmax(0).item(), summed[0,2:3].argmax(0).item(), ((summed[0,4:].argmax(0).item())-1)])
+            res = np.array([summed[0,:2].argmax(0).item(), summed[0,2:4].argmax(0).item(), ((summed[0,4:].argmax(0).item())-1)])
+            print(res)
+            res[0]=1
             return res
 
 
@@ -1037,6 +1039,6 @@ class DQN(nn.Module):
         a, logprob = self.forward(obs, test, True)
         support_weighted = logprob * self.support
         summed = support_weighted.sum(2)
-        res = np.array([summed[0,:1].argmax(0).item(), summed[0,2:3].argmax(0).item(), ((summed[0,4:].argmax(0).item()*2)-1)])
+        res = np.array([summed[0,:2].argmax(0).item(), summed[0,2:4].argmax(0).item(), ((summed[0,4:].argmax(0).item())-1)])
         return res
   

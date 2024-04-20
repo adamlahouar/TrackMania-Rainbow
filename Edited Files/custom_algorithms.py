@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 from torch.optim import Adam, AdamW, SGD
+from torch.nn.utils import clip_grad_norm_
 
 # local imports
 import tmrl.custom.custom_models as core
@@ -453,13 +454,16 @@ class RAINBOWAgent(TrainingAgent):
         self.model = model.to(device)
         self.model_target = no_grad(deepcopy(self.model))
         self.criterion = torch.nn.MSELoss()
+        self.optimiser = Adam(self.model.actor.parameters(), lr=self.lr_actor, eps=1.5e-4)
 
-        V_min = -50 # Minimum reward
-        V_max = 3000  # Maximum reward
+        self.V_min = -50 # Minimum reward
+        self.V_max = 3000  # Maximum reward
         self.atoms = 51
+        
+        self.batch_size=256
 
-        self.support = torch.linspace(V_min, V_max, self.atoms).to(device=device)  # Support (range) of z
-        self.delta_z = (V_max - V_min) / (self.atoms - 1)
+        self.support = torch.linspace(self.V_min, self.V_max, self.atoms).to(device=device)  # Support (range) of z
+        self.delta_z = (self.V_max - self.V_min) / (self.atoms - 1)
 
     def get_actor(self):
         return self.model_nograd.actor
@@ -477,7 +481,7 @@ class RAINBOWAgent(TrainingAgent):
 
 
         #look at our inputs
-        print("train")
+        # print("train")
         # print("o:")
         # for i, input_tensor in enumerate(o):
         #     print(f"Input tensor {i + 1} shape:", input_tensor.shape)
@@ -493,23 +497,22 @@ class RAINBOWAgent(TrainingAgent):
         # print("d:")
         # print(d.shape)
 
-        print("rewards")
-        print(r)
-        print("termination")
-        print(d)
+        # print("rewards")
+        # print(r)
+        # print("termination")
+        # print(d)
 
         #get actor's log prob
         _, log_pi = self.model.actor(o)
 
-        num_samples=256
-        log_pi_brake = log_pi[range(num_samples),a[:,0]]
-        log_pi_gas = log_pi[range(num_samples),a[:,1]]
-        log_pi_steer = log_pi[range(num_samples),a[:,2]+1]
+        log_pi_brake = log_pi[range(self.batch_size),a[:,0]]
+        log_pi_gas = log_pi[range(self.batch_size),a[:,1]]
+        log_pi_steer = log_pi[range(self.batch_size),a[:,2]+1]
 
-        print(log_pi.shape)
-        print(log_pi_brake.shape)
-        print(log_pi_gas.shape)
-        print(log_pi_steer.shape)
+        # print(log_pi.shape)
+        # print(log_pi_brake.shape)
+        # print(log_pi_gas.shape)
+        # print(log_pi_steer.shape)
 
         with torch.no_grad():
             _, pns = self.model.actor(o2)
@@ -517,37 +520,99 @@ class RAINBOWAgent(TrainingAgent):
             summed = dns.sum(2)
 
             # Extract argmax indices along specific ranges of `summed` tensor
-            argmax_indices_brake = summed[0, :1].argmax().item()
-            argmax_indices_gas = summed[0, 2:3].argmax().item()
-            argmax_indices_steer = (summed[0, 4:].argmax().item()) - 1
-
-            # Combine argmax indices into a numpy array (if needed, but it's not recommended)
-            argmax_indices_ns = torch.tensor([
-                argmax_indices_brake,
-                argmax_indices_gas,
-                argmax_indices_steer
-            ])
+            argmax_indices_brake = summed[range(self.batch_size), :1].argmax().item()
+            argmax_indices_gas = summed[range(self.batch_size), 2:3].argmax().item()
+            argmax_indices_steer = (summed[range(self.batch_size), 4:].argmax().item()) - 1
 
             self.model_target.reset_noise()
             _, pns = self.model_target.actor(o2)
-            pns_brake = pns[range(num_samples),a[:,0]]
-            pns_gas = pns[range(num_samples),a[:,1]]
-            pns_steer = pns[range(num_samples),a[:,2]+1]
+            pns_brake = pns[range(self.batch_size),a[:,0]]
+            pns_gas = pns[range(self.batch_size),a[:,1]]
+            pns_steer = pns[range(self.batch_size),a[:,2]+1]
+
+            discount = 0.99
+            n = 3
+
+            nonterminals = (d == 0).to(torch.float32).to(device=self.device)
+
+            # print(nonterminals)
+
+            # print(self.support.shape)
+            # print(self.support.unsqueeze(0))
+            # print(self.support.shape)
+
+
 
             #  # Compute Tz (Bellman operator T applied to z)
-            # Tz = returns.unsqueeze(1) + nonterminals * (self.discount ** self.n) * self.support.unsqueeze(0)  # Tz = R^n + (γ^n)z (accounting for terminal states)
-            # Tz = Tz.clamp(min=self.Vmin, max=self.Vmax)  # Clamp between supported values
-            # # Compute L2 projection of Tz onto fixed support z
-            # b = (Tz - self.Vmin) / self.delta_z  # b = (Tz - Vmin) / Δz
-            # l, u = b.floor().to(torch.int64), b.ceil().to(torch.int64)
-            # # Fix disappearing probability mass when l = b = u (b is int)
-            # l[(u > 0) * (l == u)] -= 1
-            # u[(l < (self.atoms - 1)) * (l == u)] += 1
+            expand_r = r.unsqueeze(1)
+            expand_support = self.support.unsqueeze(0)
 
+            discount_factor = discount**n
+            discounted_values = nonterminals.float() * discount_factor
+
+            # print(expand_r.shape)
+            # print(discounted_values.shape)
+            # print(expand_support.shape)
+
+
+            Tz = expand_r + discounted_values.unsqueeze(1) * expand_support  # Tz = R^n + (γ^n)z (accounting for terminal states)
+            
+            Tz = Tz.clamp(min=self.V_min, max=self.V_max)  # Clamp between supported values
+
+            # print(Tz.shape)
+
+            # Compute L2 projection of Tz onto fixed support z
+            b = (Tz - self.V_min) / self.delta_z  # b = (Tz - Vmin) / Δz
+            l, u = b.floor().to(torch.int64), b.ceil().to(torch.int64)
+            # Fix disappearing probability mass when l = b = u (b is int)
+            l[(u > 0) * (l == u)] -= 1
+            u[(l < (self.atoms - 1)) * (l == u)] += 1
+
+            # print(u)
+            # Distribute probability of Tz
+
+            m = torch.zeros(self.batch_size, self.atoms, device=self.device, dtype = o[1].dtype)
+            offset = torch.linspace(0, ((self.batch_size - 1) * self.atoms), self.batch_size).unsqueeze(1).expand(self.batch_size, self.atoms).to(device=self.device)
+            m_brake = m
+            m_gas = m
+            m_steer = m
+
+            # Helper function to perform index_add_ operation
+            def update_tensor_with_indices(tensor, indices, values):
+                # Flatten the tensor to apply index_add_
+                flat_tensor = tensor.view(-1)
+                # Convert indices to int64 dtype
+                indices = indices.view(-1).to(torch.int64)
+                # Perform index_add_ operation
+                flat_tensor.index_add_(0, indices, values.view(-1))
+
+            # Update `m_brake` tensor with indices and values
+            update_tensor_with_indices(m_brake, (l + offset), (pns_brake * (u.float() - b)))
+            update_tensor_with_indices(m_brake, (u + offset), (pns_brake * (b - l.float())))
+
+            # Update `m_gas` tensor with indices and values
+            update_tensor_with_indices(m_gas, (l + offset), (pns_gas * (u.float() - b)))
+            update_tensor_with_indices(m_gas, (u + offset), (pns_gas * (b - l.float())))
+
+            # Update `m_steer` tensor with indices and values
+            update_tensor_with_indices(m_steer, (l + offset), (pns_steer * (u.float() - b)))
+            update_tensor_with_indices(m_steer, (u + offset), (pns_steer * (b - l.float())))
+        
+        loss = torch.sum(m_brake * log_pi_brake, 1) + torch.sum(m_gas * log_pi_gas, 1) + torch.sum(m_steer * log_pi_steer, 1) # Cross-entropy loss (minimises DKL(m||p(s_t, a_t)))
+        self.model.actor.zero_grad()
+        loss.mean().backward()
+
+        norm_clip = 10
+
+        clip_grad_norm_(self.model.actor.parameters(), norm_clip)
+        self.optimiser.step()
+
+        #update target
+        self.model_target.actor.load_state_dict(self.model.actor.state_dict())
 
         ret_dict = dict(
-                    loss_actor=0,
-                    loss_critic=0,
+                    loss_actor=loss.mean().item(),
+                    loss_critic=loss.mean().item(),
                 )
         return ret_dict
         
