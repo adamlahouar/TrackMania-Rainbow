@@ -1005,7 +1005,6 @@ class DQNActor(TorchActorModule):
             # gives 
             res = np.array([summed[0,:2].argmax(0).item(), summed[0,2:4].argmax(0).item(), ((summed[0,4:].argmax(0).item())-1)])
             print(res)
-            res[0]=1
             return res
 
 
