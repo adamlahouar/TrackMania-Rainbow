@@ -926,11 +926,11 @@ class DQNActor(TorchActorModule):
 
         self.support = torch.linspace(V_min, V_max, self.atoms).to(device=device)  # Support (range) of z
 
-        self.dense = nn.Sequential(nn.Linear(83, 128), activation(),
-                                        nn.Linear(128, 256), activation(),
-                                        nn.Linear(256, 512), activation(),
-                                        nn.Linear(512, 1024), activation())
-        self.dense_output_size = 1024
+        self.dense = nn.Sequential(nn.Linear(83, 256), activation(),
+                                        nn.Linear(256, 1024), activation(),
+                                        nn.Linear(1024, 2048), activation(),
+                                        nn.Linear(2048, 2048), activation())
+        self.dense_output_size = 2048
         self.fc_h_v = NoisyLinear(self.dense_output_size, hidden_size, std_init=noisy_std)
         self.fc_h_a = NoisyLinear(self.dense_output_size, hidden_size, std_init=noisy_std)
         self.fc_z_v = NoisyLinear(hidden_size, self.atoms, std_init=noisy_std)
@@ -956,32 +956,7 @@ class DQNActor(TorchActorModule):
         
         q = v + a - a.mean(1, keepdim=True)  # Combine streams
 
-        # print(q)
-
-        if with_logprob:  # Use log softmax for numerical stability
-            logprob = F.log_softmax(q, dim=2)  # Log probabilities with action over second dimension
-        else:
-            logprob= None
-
-        # prob = F.softmax(q, dim=2)[0]  # Probabilities with action over second dimension
-
-        # # Get the number of columns (elements per row)
-        # num_cols = prob.shape[1]
-        
-        # # Create indices corresponding to the positions of elements in each row
-        # indices = torch.arange(num_cols, dtype=torch.float32).to(device=self.device)
-
-        # # Multiply each element by its index
-        # weighted_values = prob * indices
-
-        # # Calculate the mean along each row to get the custom score
-        # scores = torch.sum(weighted_values, dim=1)/num_cols
-
-        # scores[2] = (scores[2]*2) - 1
-        # scores[0]=0
-        # print(scores)
-
-        return None, logprob
+        return F.softmax(q, dim=2), F.log_softmax(q, dim=2)
     
     def reset_noise(self):
         for name, module in self.named_children():
@@ -1003,8 +978,17 @@ class DQNActor(TorchActorModule):
             support_weighted = logprob * self.support
             summed = support_weighted.sum(2)
             # gives 
+            
+
             res = np.array([summed[0,:2].argmax(0).item(), summed[0,2:4].argmax(0).item(), ((summed[0,4:].argmax(0).item())-1)])
+
+            
+
+            # action = summed.argmax(0).item()
+            # actions = {np.array([1,0,-1]), np.array([1,0,0]), np.array([1,0,1]), np.array([0,0,-1]), np.array([0,0,0]), np.array([0,0,1])}
+            # res = actions[action]
             print(res)
+            # res[1]=0
             return res
 
 
@@ -1038,6 +1022,13 @@ class DQN(nn.Module):
         a, logprob = self.forward(obs, test, True)
         support_weighted = logprob * self.support
         summed = support_weighted.sum(2)
+        # res = np.array([summed[0,:2].argmax(0).item(), summed[0,2:4].argmax(0).item(), ((summed[0,4:].argmax(0).item())-1)])
+        
+        
         res = np.array([summed[0,:2].argmax(0).item(), summed[0,2:4].argmax(0).item(), ((summed[0,4:].argmax(0).item())-1)])
+
+        # action = summed.argmax(0).item()
+        # actions = {np.array([1,0,-1]), np.array([1,0,0]), np.array([1,0,1]), np.array([0,0,-1]), np.array([0,0,0]), np.array([0,0,1])}
+        # res = actions[action]
         return res
   

@@ -453,13 +453,16 @@ class RAINBOWAgent(TrainingAgent):
         logging.debug(f" device RAIN: {device}")
         self.model = model.to(device)
         self.model_target = no_grad(deepcopy(self.model))
+        with torch.no_grad():
+            for param in self.model_target.parameters():
+                param.requires_grad = False
         self.criterion = torch.nn.MSELoss()
         self.optimiser = Adam(self.model.actor.parameters(), lr=self.lr_actor, eps=1.5e-4)
 
         self.V_min = -50 # Minimum reward
         self.V_max = 3000  # Maximum reward
         self.atoms = 51
-        
+        self.iter = 0
         self.batch_size=256
 
         self.support = torch.linspace(self.V_min, self.V_max, self.atoms).to(device=device)  # Support (range) of z
@@ -505,9 +508,16 @@ class RAINBOWAgent(TrainingAgent):
         #get actor's log prob
         _, log_pi = self.model.actor(o)
 
-        log_pi_brake = log_pi[range(self.batch_size),a[:,0]]
-        log_pi_gas = log_pi[range(self.batch_size),a[:,1]]
+        log_pi_gas = log_pi[range(self.batch_size),a[:,0]]
+        log_pi_brake = log_pi[range(self.batch_size),a[:,1]]
         log_pi_steer = log_pi[range(self.batch_size),a[:,2]+1]
+
+
+        _, tlog_pi = self.model_target.actor(o)
+
+        tlog_pi_gas = tlog_pi[range(self.batch_size),a[:,0]]
+        tlog_pi_brake = tlog_pi[range(self.batch_size),a[:,1]]
+        tlog_pi_steer = tlog_pi[range(self.batch_size),a[:,2]+1]
 
         # print(log_pi.shape)
         # print(log_pi_brake.shape)
@@ -515,23 +525,28 @@ class RAINBOWAgent(TrainingAgent):
         # print(log_pi_steer.shape)
 
         with torch.no_grad():
-            _, pns = self.model.actor(o2)
+            pns, _ = self.model.actor(o2)
             dns = self.support.expand_as(pns) * pns
             summed = dns.sum(2)
 
+            # print(summed.shape)
+
             # Extract argmax indices along specific ranges of `summed` tensor
-            argmax_indices_brake = summed[range(self.batch_size), :1].argmax().item()
-            argmax_indices_gas = summed[range(self.batch_size), 2:3].argmax().item()
-            argmax_indices_steer = (summed[range(self.batch_size), 4:].argmax().item()) - 1
+            argmax_indices_gas = torch.argmax(summed[:, :2], dim=1)
+            argmax_indices_brake = torch.argmax(summed[:, 2:4], dim=1)
+            argmax_indices_steer = torch.argmax(summed[:, 4:], dim=1)
+
+            # print(argmax_indices_brake)
+
 
             self.model_target.reset_noise()
-            _, pns = self.model_target.actor(o2)
-            pns_brake = pns[range(self.batch_size),a[:,0]]
-            pns_gas = pns[range(self.batch_size),a[:,1]]
-            pns_steer = pns[range(self.batch_size),a[:,2]+1]
+            pns, _ = self.model_target.actor(o2)
+            pns_gas = pns[range(self.batch_size),argmax_indices_gas]
+            pns_brake = pns[range(self.batch_size),argmax_indices_brake+2]
+            pns_steer = pns[range(self.batch_size),argmax_indices_steer+4]
 
             discount = 0.99
-            n = 3
+            n = 0
 
             nonterminals = (d == 0).to(torch.float32).to(device=self.device)
 
@@ -541,14 +556,13 @@ class RAINBOWAgent(TrainingAgent):
             # print(self.support.unsqueeze(0))
             # print(self.support.shape)
 
-
-
+            
+            discount_factor = discount**n
+            discounted_values = nonterminals.float() * discount_factor
             #  # Compute Tz (Bellman operator T applied to z)
             expand_r = r.unsqueeze(1)
             expand_support = self.support.unsqueeze(0)
 
-            discount_factor = discount**n
-            discounted_values = nonterminals.float() * discount_factor
 
             # print(expand_r.shape)
             # print(discounted_values.shape)
@@ -573,9 +587,6 @@ class RAINBOWAgent(TrainingAgent):
 
             m = torch.zeros(self.batch_size, self.atoms, device=self.device, dtype = o[1].dtype)
             offset = torch.linspace(0, ((self.batch_size - 1) * self.atoms), self.batch_size).unsqueeze(1).expand(self.batch_size, self.atoms).to(device=self.device)
-            m_brake = m
-            m_gas = m
-            m_steer = m
 
             # Helper function to perform index_add_ operation
             def update_tensor_with_indices(tensor, indices, values):
@@ -586,33 +597,39 @@ class RAINBOWAgent(TrainingAgent):
                 # Perform index_add_ operation
                 flat_tensor.index_add_(0, indices, values.view(-1))
 
-            # Update `m_brake` tensor with indices and values
-            update_tensor_with_indices(m_brake, (l + offset), (pns_brake * (u.float() - b)))
-            update_tensor_with_indices(m_brake, (u + offset), (pns_brake * (b - l.float())))
-
             # Update `m_gas` tensor with indices and values
-            update_tensor_with_indices(m_gas, (l + offset), (pns_gas * (u.float() - b)))
-            update_tensor_with_indices(m_gas, (u + offset), (pns_gas * (b - l.float())))
+            update_tensor_with_indices(m, (l + offset), (pns_gas * (u.float() - b)))
+            update_tensor_with_indices(m, (u + offset), (pns_gas * (b - l.float())))
+
+            # Update `m_brake` tensor with indices and values
+            update_tensor_with_indices(m, (l + offset), (pns_brake * (u.float() - b)))
+            update_tensor_with_indices(m, (u + offset), (pns_brake * (b - l.float())))
 
             # Update `m_steer` tensor with indices and values
-            update_tensor_with_indices(m_steer, (l + offset), (pns_steer * (u.float() - b)))
-            update_tensor_with_indices(m_steer, (u + offset), (pns_steer * (b - l.float())))
+            update_tensor_with_indices(m, (l + offset), (pns_steer * (u.float() - b)))
+            update_tensor_with_indices(m, (u + offset), (pns_steer * (b - l.float())))
         
-        loss = torch.sum(m_brake * log_pi_brake, 1) + torch.sum(m_gas * log_pi_gas, 1) + torch.sum(m_steer * log_pi_steer, 1) # Cross-entropy loss (minimises DKL(m||p(s_t, a_t)))
+        loss = (-torch.sum(m * log_pi_gas, 1)) + (-torch.sum(m * log_pi_brake, 1))  + (-torch.sum(m * log_pi_steer, 1)) # Cross-entropy loss (minimises DKL(m||p(s_t, a_t)))
+        tloss = (-torch.sum(m * tlog_pi_gas, 1)) + (-torch.sum(m * tlog_pi_brake, 1))  + (-torch.sum(m * tlog_pi_steer, 1))
+        # print(loss.mean())
         self.model.actor.zero_grad()
         loss.mean().backward()
 
-        norm_clip = 10
+        norm_clip = 5
 
         clip_grad_norm_(self.model.actor.parameters(), norm_clip)
         self.optimiser.step()
 
-        #update target
-        self.model_target.actor.load_state_dict(self.model.actor.state_dict())
+        self.iter+=1
+
+        if(self.iter%500):
+            #update target
+            self.model_target.actor.load_state_dict(self.model.actor.state_dict())
+            self.iter=0
 
         ret_dict = dict(
                     loss_actor=loss.mean().item(),
-                    loss_critic=loss.mean().item(),
+                    loss_critic=tloss.mean().item(),
                 )
         return ret_dict
         
