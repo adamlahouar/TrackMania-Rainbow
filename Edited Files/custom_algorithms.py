@@ -460,13 +460,14 @@ class RAINBOWAgent(TrainingAgent):
         self.optimiser = Adam(self.model.actor.parameters(), lr=self.lr_actor, eps=1.5e-4)
 
         self.V_min = -50 # Minimum reward
-        self.V_max = 3000  # Maximum reward
-        self.atoms = 51
+        self.V_max = 700  # Maximum reward
+        self.atoms = 500
         self.iter = 0
         self.batch_size=256
 
         self.support = torch.linspace(self.V_min, self.V_max, self.atoms).to(device=device)  # Support (range) of z
         self.delta_z = (self.V_max - self.V_min) / (self.atoms - 1)
+        torch.autograd.set_detect_anomaly(True)
 
     def get_actor(self):
         return self.model_nograd.actor
@@ -480,44 +481,68 @@ class RAINBOWAgent(TrainingAgent):
         # o2 = new observation
         # d = terminated
 
+        arrays = [
+                np.array([0, 0, 0]),
+                np.array([0, 0, -1]),
+                np.array([0, 0, 1]),
+                np.array([0, 1, 0]),
+                np.array([0, 1, -1]),
+                np.array([0, 1, 1]),
+                np.array([1, 0, 0]),
+                np.array([1, 0, -1]),
+                np.array([1, 0, 1]),
+                np.array([1, 1, 0]),
+                np.array([1, 1, -1]),
+                np.array([1, 1, 1])
+            ]
+        
+        # Convert the list of arrays to a single NumPy array
+        arrays_np = np.array(arrays, dtype=np.float32)
 
+        # Convert the NumPy array to a PyTorch tensor
+        arrays_tensor = torch.tensor(arrays_np).to(device=self.device)
 
+        def batched_find_nearest_array_indices(input_tensor, arrays_tensor, batch_size=256):
+            num_input = input_tensor.shape[0]
+            nearest_indices = []
+            
+            with torch.no_grad():
+                for start in range(0, num_input, batch_size):
+                    end = min(start + batch_size, num_input)
+                    batch_input = input_tensor[start:end]
+                    
+                    # Compute squared distances using broadcasting
+                    distances = torch.sum((arrays_tensor.unsqueeze(0) - batch_input.unsqueeze(1))**2, dim=2)
+                    
+                    # Find nearest indices for each element in the batch
+                    batch_nearest_indices = torch.argmin(distances, dim=1)
+                    nearest_indices.append(batch_nearest_indices)
+            
+            # Concatenate all nearest indices from batches
+            return torch.cat(nearest_indices)
 
-        #look at our inputs
-        # print("train")
-        # print("o:")
-        # for i, input_tensor in enumerate(o):
-        #     print(f"Input tensor {i + 1} shape:", input_tensor.shape)
-        #     print(input_tensor)
-        # print("a:")
-        # print(a.shape)
-        # print("r:")
-        # print(r.shape)
-        # print("o2:")
-        # for i, input_tensor in enumerate(o2):
-        #     print(f"Input tensor {i + 1} shape:", input_tensor.shape)
-        #     print(input_tensor)
-        # print("d:")
-        # print(d.shape)
+        a_i = batched_find_nearest_array_indices(a, arrays_tensor)
+        # print(a)
+        # print(a_i)
 
-        # print("rewards")
-        # print(r)
-        # print("termination")
-        # print(d)
 
         #get actor's log prob
         _, log_pi = self.model.actor(o)
 
-        log_pi_gas = log_pi[range(self.batch_size),a[:,0]]
-        log_pi_brake = log_pi[range(self.batch_size),a[:,1]]
-        log_pi_steer = log_pi[range(self.batch_size),a[:,2]+1]
+        # log_pi_gas = log_pi[range(self.batch_size),a[:,0]]
+        # log_pi_brake = log_pi[range(self.batch_size),a[:,1]]
+        # log_pi_steer = log_pi[range(self.batch_size),a[:,2]+1]
+
+        log_pi_a = log_pi[range(self.batch_size),a_i[:]]
 
 
         _, tlog_pi = self.model_target.actor(o)
 
-        tlog_pi_gas = tlog_pi[range(self.batch_size),a[:,0]]
-        tlog_pi_brake = tlog_pi[range(self.batch_size),a[:,1]]
-        tlog_pi_steer = tlog_pi[range(self.batch_size),a[:,2]+1]
+        # tlog_pi_gas = tlog_pi[range(self.batch_size),a[:,0]]
+        # tlog_pi_brake = tlog_pi[range(self.batch_size),a[:,1]]
+        # tlog_pi_steer = tlog_pi[range(self.batch_size),a[:,2]+1]
+
+        tlog_pi_a = tlog_pi[range(self.batch_size),a_i[:]]
 
         # print(log_pi.shape)
         # print(log_pi_brake.shape)
@@ -532,18 +557,21 @@ class RAINBOWAgent(TrainingAgent):
             # print(summed.shape)
 
             # Extract argmax indices along specific ranges of `summed` tensor
-            argmax_indices_gas = torch.argmax(summed[:, :2], dim=1)
-            argmax_indices_brake = torch.argmax(summed[:, 2:4], dim=1)
-            argmax_indices_steer = torch.argmax(summed[:, 4:], dim=1)
+            argmax_indices_a = torch.argmax(summed[:], dim=1)
+
+            # argmax_indices_gas = torch.argmax(summed[:, :2], dim=1)
+            # argmax_indices_brake = torch.argmax(summed[:, 2:4], dim=1)
+            # argmax_indices_steer = torch.argmax(summed[:, 4:], dim=1)
 
             # print(argmax_indices_brake)
 
 
             self.model_target.reset_noise()
             pns, _ = self.model_target.actor(o2)
-            pns_gas = pns[range(self.batch_size),argmax_indices_gas]
-            pns_brake = pns[range(self.batch_size),argmax_indices_brake+2]
-            pns_steer = pns[range(self.batch_size),argmax_indices_steer+4]
+            pns_a = pns[range(self.batch_size),argmax_indices_a]
+            # pns_gas = pns[range(self.batch_size),argmax_indices_gas]
+            # pns_brake = pns[range(self.batch_size),argmax_indices_brake+2]
+            # pns_steer = pns[range(self.batch_size),argmax_indices_steer+4]
 
             discount = 0.99
             n = 0
@@ -597,32 +625,36 @@ class RAINBOWAgent(TrainingAgent):
                 # Perform index_add_ operation
                 flat_tensor.index_add_(0, indices, values.view(-1))
 
-            # Update `m_gas` tensor with indices and values
-            update_tensor_with_indices(m, (l + offset), (pns_gas * (u.float() - b)))
-            update_tensor_with_indices(m, (u + offset), (pns_gas * (b - l.float())))
+            update_tensor_with_indices(m, (l + offset), (pns_a * (u.float() - b)))
+            update_tensor_with_indices(m, (u + offset), (pns_a * (b - l.float())))
 
-            # Update `m_brake` tensor with indices and values
-            update_tensor_with_indices(m, (l + offset), (pns_brake * (u.float() - b)))
-            update_tensor_with_indices(m, (u + offset), (pns_brake * (b - l.float())))
+            # # Update `m_gas` tensor with indices and values
+            # update_tensor_with_indices(m, (l + offset), (pns_gas * (u.float() - b)))
+            # update_tensor_with_indices(m, (u + offset), (pns_gas * (b - l.float())))
 
-            # Update `m_steer` tensor with indices and values
-            update_tensor_with_indices(m, (l + offset), (pns_steer * (u.float() - b)))
-            update_tensor_with_indices(m, (u + offset), (pns_steer * (b - l.float())))
+            # # Update `m_brake` tensor with indices and values
+            # update_tensor_with_indices(m, (l + offset), (pns_brake * (u.float() - b)))
+            # update_tensor_with_indices(m, (u + offset), (pns_brake * (b - l.float())))
+
+            # # Update `m_steer` tensor with indices and values
+            # update_tensor_with_indices(m, (l + offset), (pns_steer * (u.float() - b)))
+            # update_tensor_with_indices(m, (u + offset), (pns_steer * (b - l.float())))
         
-        loss = (-torch.sum(m * log_pi_gas, 1)) + (-torch.sum(m * log_pi_brake, 1))  + (-torch.sum(m * log_pi_steer, 1)) # Cross-entropy loss (minimises DKL(m||p(s_t, a_t)))
-        tloss = (-torch.sum(m * tlog_pi_gas, 1)) + (-torch.sum(m * tlog_pi_brake, 1))  + (-torch.sum(m * tlog_pi_steer, 1))
+        # loss = (-torch.sum(m * log_pi_gas, 1)) + (-torch.sum(m * log_pi_brake, 1))  + (-torch.sum(m * log_pi_steer, 1)) # Cross-entropy loss (minimises DKL(m||p(s_t, a_t)))
+        # tloss = (-torch.sum(m * tlog_pi_gas, 1)) + (-torch.sum(m * tlog_pi_brake, 1))  + (-torch.sum(m * tlog_pi_steer, 1))
+        loss = (-torch.sum(m * log_pi_a, 1))
+        tloss = (-torch.sum(m * tlog_pi_a, 1))
+        
         # print(loss.mean())
         self.model.actor.zero_grad()
         loss.mean().backward()
 
-        norm_clip = 5
-
+        norm_clip = 10
         clip_grad_norm_(self.model.actor.parameters(), norm_clip)
         self.optimiser.step()
 
         self.iter+=1
-
-        if(self.iter%500):
+        if((self.iter%1000)==0):
             #update target
             self.model_target.actor.load_state_dict(self.model.actor.state_dict())
             self.iter=0

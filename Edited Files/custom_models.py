@@ -906,10 +906,10 @@ class PreprocessLayer(nn.Module):
 
 
 class DQNActor(TorchActorModule):
-    def __init__(self, observation_space, action_space, atoms = 51, hidden_size = 512, noisy_std=0.1, activation=nn.ReLU, device = "cpu"):
+    def __init__(self, observation_space, action_space, atoms = 500, hidden_size = 512, noisy_std=0.1, activation=nn.ReLU, device = "cpu"):
         super().__init__(observation_space, action_space)
         # print(observation_space)
-        dim_act = (action_space.shape[0] *2)+1 #2 actions options per action +1 for straight steering
+        dim_act = (action_space.shape[0] *4) #2 actions options per action +1 for straight steering
         act_limit = action_space.high[0]
 
         self.process=PreprocessLayer()
@@ -917,7 +917,7 @@ class DQNActor(TorchActorModule):
         self.device=device
 
         V_min = -50 # Minimum reward
-        V_max = 3000  # Maximum reward
+        V_max = 700  # Maximum reward
 
 
         self.atoms = atoms
@@ -927,10 +927,9 @@ class DQNActor(TorchActorModule):
         self.support = torch.linspace(V_min, V_max, self.atoms).to(device=device)  # Support (range) of z
 
         self.dense = nn.Sequential(nn.Linear(83, 256), activation(),
-                                        nn.Linear(256, 1024), activation(),
-                                        nn.Linear(1024, 2048), activation(),
-                                        nn.Linear(2048, 2048), activation())
-        self.dense_output_size = 2048
+                                        nn.Linear(256, 512), activation(),
+                                        nn.Linear(512, 512), activation())
+        self.dense_output_size = 512
         self.fc_h_v = NoisyLinear(self.dense_output_size, hidden_size, std_init=noisy_std)
         self.fc_h_a = NoisyLinear(self.dense_output_size, hidden_size, std_init=noisy_std)
         self.fc_z_v = NoisyLinear(hidden_size, self.atoms, std_init=noisy_std)
@@ -979,8 +978,24 @@ class DQNActor(TorchActorModule):
             summed = support_weighted.sum(2)
             # gives 
             
+            arrays = [
+                np.array([0, 0, 0]),
+                np.array([0, 0, -1]),
+                np.array([0, 0, 1]),
+                np.array([0, 1, 0]),
+                np.array([0, 1, -1]),
+                np.array([0, 1, 1]),
+                np.array([1, 0, 0]),
+                np.array([1, 0, -1]),
+                np.array([1, 0, 1]),
+                np.array([1, 1, 0]),
+                np.array([1, 1, -1]),
+                np.array([1, 1, 1])
+            ]
+            # print(summed[0,:].argmax(0).item())
+            res = arrays[summed[0,:].argmax(0).item()]
 
-            res = np.array([summed[0,:2].argmax(0).item(), summed[0,2:4].argmax(0).item(), ((summed[0,4:].argmax(0).item())-1)])
+            # res = np.array([summed[0,:2].argmax(0).item(), summed[0,2:4].argmax(0).item(), ((summed[0,4:].argmax(0).item())-1)])
 
             
 
@@ -1000,8 +1015,8 @@ class DQN(nn.Module):
     super(DQN, self).__init__()
     self.actor = DQNActor(observation_space, action_space, device=device)
     V_min = -50 # Minimum reward
-    V_max = 3000  # Maximum reward
-    atoms = 51
+    V_max = 700  # Maximum reward
+    atoms = 500
     self.support = torch.linspace(V_min, V_max, atoms).to(device=device)  # Support (range) of z
   def reset_noise(self):
     self.actor.reset_noise()
@@ -1024,8 +1039,24 @@ class DQN(nn.Module):
         summed = support_weighted.sum(2)
         # res = np.array([summed[0,:2].argmax(0).item(), summed[0,2:4].argmax(0).item(), ((summed[0,4:].argmax(0).item())-1)])
         
-        
-        res = np.array([summed[0,:2].argmax(0).item(), summed[0,2:4].argmax(0).item(), ((summed[0,4:].argmax(0).item())-1)])
+        arrays = [
+                np.array([0, 0, 0]),
+                np.array([0, 0, -1]),
+                np.array([0, 0, 1]),
+                np.array([0, 1, 0]),
+                np.array([0, 1, -1]),
+                np.array([0, 1, 1]),
+                np.array([1, 0, 0]),
+                np.array([1, 0, -1]),
+                np.array([1, 0, 1]),
+                np.array([1, 1, 0]),
+                np.array([1, 1, -1]),
+                np.array([1, 1, 1])
+            ]
+        # print(summed[0,:].argmax(0).item())
+        res = arrays[summed[0,:].argmax(0).item()]
+
+        # res = np.array([summed[0,:2].argmax(0).item(), summed[0,2:4].argmax(0).item(), ((summed[0,4:].argmax(0).item())-1)])
 
         # action = summed.argmax(0).item()
         # actions = {np.array([1,0,-1]), np.array([1,0,0]), np.array([1,0,1]), np.array([0,0,-1]), np.array([0,0,0]), np.array([0,0,1])}
