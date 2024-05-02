@@ -168,7 +168,7 @@ class RainbowActorModule(TorchActorModule):
     def __init__(self, observation_space, action_space, atoms=500, hidden_size=512, noisy_std=0.1, activation=nn.ReLU):
         super().__init__(observation_space, action_space)
 
-        dim_act = (action_space.shape[0] * 4)  # 2 actions options per action +1 for straight steering
+        dim_act = len(params.possible_actions)
         act_limit = action_space.high[0]
 
         self.process = PreprocessLayer()
@@ -177,6 +177,7 @@ class RainbowActorModule(TorchActorModule):
 
         # TODO: make this a parameter
         self.atoms = atoms
+        self.epsilon = 1e-3
 
         self.action_space = action_space
         # print(action_space)
@@ -224,6 +225,11 @@ class RainbowActorModule(TorchActorModule):
                 module.reset_noise()
 
     def act(self, obs, test=False):
+
+        if np.random.random() < self.epsilon:
+            random_index = np.random.randint(len(params.possible_actions))
+            return params.possible_actions[random_index]
+
         with torch.no_grad():
             action_probs, _ = self.forward(obs=obs, log=False)
 
@@ -363,7 +369,7 @@ class RAINTrainingAgent(TrainingAgent):
         diff = actions.unsqueeze(1) - params.possible_actions_tensor_trainer
         distances = torch.norm(diff, dim=2)
         indices = torch.argmin(distances, dim=1)
-        return indices
+        return indices.clamp(0, len(params.possible_actions) - 1)
 
 
 training_agent_cls = partial(RAINTrainingAgent,
