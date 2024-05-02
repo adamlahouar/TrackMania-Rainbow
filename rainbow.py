@@ -321,11 +321,7 @@ class RAINTrainingAgent(TrainingAgent):
             # Compute Tz (Bellman operator T applied to z)
             # TODO: figure out self.n
             Tz = rewards.unsqueeze(1) + terminated.unsqueeze(1) * (self.gamma ** self.n) * self.support.unsqueeze(0)
-            Tz_unclamped = torch.clone(Tz)
             Tz = Tz.clamp(min=self.V_min, max=self.V_max)
-
-            if not torch.equal(Tz, Tz_unclamped):
-                print('Tz clamped!')
 
             # Compute L2 project of Tz onto fixed support z
             b = (Tz - self.V_min) / self.delta_z
