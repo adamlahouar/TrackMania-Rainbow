@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import Adam
+from torch import Tensor
 
 # Other imports
 import os
@@ -74,6 +75,21 @@ class ConfigParameters:
         self.imgs_buf_len = cfg.IMG_HIST_LEN
         self.act_buf_len = cfg.ACT_BUF_LEN
 
+        # Custom stuff
+        self.possible_actions = np.array(
+            [np.array([0, 0, 0]), np.array([0, 0, -1]), np.array([0, 0, 1]), np.array([0, 1, 0]),
+             np.array([0, 1, -1]), np.array([0, 1, 1]), np.array([1, 0, 0]), np.array([1, 0, -1]),
+             np.array([1, 0, 1]), np.array([1, 1, 0]), np.array([1, 1, -1]), np.array([1, 1, 1])])
+
+        self.possible_actions_tensor_trainer = torch.tensor(self.possible_actions, dtype=torch.float32).to(
+            device=self.device_trainer)
+        self.possible_actions_tensor_worker = torch.tensor(self.possible_actions, dtype=torch.float32).to(
+            device=self.device_worker)
+
+        self.V_MIN = -5
+        self.V_MAX = 5
+        self.atoms = 500
+
 
 params = ConfigParameters()
 
@@ -89,7 +105,7 @@ memory_cls = partial(params.memory_base_cls,
 
 # Factorised NoisyLinear layer with bias
 class NoisyLinear(nn.Module):
-    def __init__(self, in_features, out_features, std_init=0.5):
+    def __init__(self, in_features: int, out_features: int, std_init=0.5):
         super(NoisyLinear, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -120,40 +136,31 @@ class NoisyLinear(nn.Module):
         self.weight_epsilon.copy_(epsilon_out.ger(epsilon_in))
         self.bias_epsilon.copy_(epsilon_out)
 
-    def forward(self, input, test=False):
-        if not test:
+    def forward(self, input, log=False):
+        if log:
             return F.linear(input, self.weight_mu + self.weight_sigma * self.weight_epsilon,
                             self.bias_mu + self.bias_sigma * self.bias_epsilon)
-        else:
-            return F.linear(input, self.weight_mu, self.bias_mu)
+
+        return F.linear(input, self.weight_mu, self.bias_mu)
 
 
 class PreprocessLayer(nn.Module):
     def __init__(self):
         super(PreprocessLayer, self).__init__()
 
-    def preprocess_input(self, input_tensor):
-        # Flatten or reshape the input tensor to have a consistent shape
-        if input_tensor.dim() < 1:
-            input_tensor = input_tensor.expand((1, 3))
-        return input_tensor
-
-    def forward(self, input_tuple):
+    def _process_input(self, input_tensors: tuple[Tensor]) -> list[Tensor]:
         processed_tensors = []
 
-        for input_tensor in input_tuple:
-            # Preprocess each input tensor
-            processed_tensor = self.preprocess_input(input_tensor)
-            processed_tensors.append(processed_tensor)
+        for tensor in input_tensors:
+            if tensor.dim() < 1:
+                tensor = tensor.expand((1, 3))
+            processed_tensors.append(tensor)
 
-        # print(processed_tensors)
-        # for tensor in processed_tensors:
-        #     print(tensor.shape)
-        # Concatenate processed tensors along a new dimension (batch_size)
-        processed_tensor = torch.cat(processed_tensors, dim=1)
-        # print(processed_tensor.shape)
+        return processed_tensors
 
-        return processed_tensor
+    def forward(self, input_tensors: tuple[Tensor]) -> Tensor:
+        processed_tensors = self._process_input(input_tensors)
+        return torch.cat(processed_tensors, dim=1)
 
 
 class RainbowActorModule(TorchActorModule):
@@ -168,14 +175,13 @@ class RainbowActorModule(TorchActorModule):
 
         self.device = params.device_worker
 
-        V_min = -50  # Minimum reward
-        V_max = 700  # Maximum reward
-
+        # TODO: make this a parameter
         self.atoms = atoms
+
         self.action_space = action_space
         # print(action_space)
 
-        self.support = torch.linspace(V_min, V_max, self.atoms).to(device=self.device)  # Support (range) of z
+        self.support = torch.linspace(params.V_MIN, params.V_MAX, self.atoms).to(device=self.device)  # Support (range) of z
 
         self.dense = nn.Sequential(nn.Linear(83, 256), activation(),
                                    nn.Linear(256, 512), activation(),
@@ -189,20 +195,27 @@ class RainbowActorModule(TorchActorModule):
         self.act_limit = act_limit
         self.dim_act = dim_act
 
-    def forward(self, obs, test=False):
+    def forward(self, obs, log=False) -> tuple[Tensor, Tensor]:
+
+        # Process observation
         processed_tensor = self.process(obs)
 
+        # Feed into dense layer
         x = self.dense(processed_tensor)
         x = x.view(-1, self.dense_output_size)
-        v = self.fc_z_v(F.relu(self.fc_h_v(x), test), test)  # Value stream
-        a = self.fc_z_a(F.relu(self.fc_h_a(x, test)), test)  # Advantage stream
+
+        # Value and Advantage streams
+        v = self.fc_z_v(F.relu(self.fc_h_v(x, log)), log)
+        a = self.fc_z_a(F.relu(self.fc_h_a(x, log)), log)
 
         # Reshape v and a for atoms dimension
         v = v.view(-1, 1, self.atoms)
         a = a.view(-1, self.dim_act, self.atoms)
 
-        q = v + a - a.mean(1, keepdim=True)  # Combine streams
+        # Combine streams
+        q = v + a - a.mean(1, keepdim=True)
 
+        # Return action probabilities and log-probabilities
         return F.softmax(q, dim=2), F.log_softmax(q, dim=2)
 
     def reset_noise(self):
@@ -212,29 +225,15 @@ class RainbowActorModule(TorchActorModule):
 
     def act(self, obs, test=False):
         with torch.no_grad():
-            a, logprob = self.forward(obs=obs, test=test)
+            action_probs, _ = self.forward(obs=obs, log=False)
 
-            support_weighted = logprob * self.support
+            support_weighted = action_probs * self.support
             summed = support_weighted.sum(2)
 
-            arrays = [
-                np.array([0, 0, 0]),
-                np.array([0, 0, -1]),
-                np.array([0, 0, 1]),
-                np.array([0, 1, 0]),
-                np.array([0, 1, -1]),
-                np.array([0, 1, 1]),
-                np.array([1, 0, 0]),
-                np.array([1, 0, -1]),
-                np.array([1, 0, 1]),
-                np.array([1, 1, 0]),
-                np.array([1, 1, -1]),
-                np.array([1, 1, 1])
-            ]
+            best_action_index = summed.argmax(1).item()
 
-            res = arrays[summed[0, :].argmax(0).item()]
-
-            return res
+            best_action = params.possible_actions[best_action_index]
+            return best_action
 
 
 class DQN(nn.Module):
@@ -282,11 +281,16 @@ class RAINTrainingAgent(TrainingAgent):
         self.criterion = torch.nn.MSELoss()
         self.optimizer = Adam(self.model.actor.parameters(), lr=self.lr_actor, eps=1.5e-4)
 
-        self.V_min = -50
-        self.V_max = 700
-        self.atoms = 500
+        self.V_min = params.V_MIN
+        self.V_max = params.V_MAX
+        self.atoms = params.atoms
+
         self.iter = 0
-        self.batch_size = 256
+        self.batch_size = params.batch_size
+        self.norm_clip = 10
+
+        # TODO: figure out what this should be
+        self.n = 1
 
         self.support = torch.linspace(self.V_min, self.V_max, self.atoms).to(device=self.device)
         self.delta_z = (self.V_max - self.V_min) / (self.atoms - 1)
@@ -296,125 +300,74 @@ class RAINTrainingAgent(TrainingAgent):
         return self.model_nograd.actor
 
     def train(self, batch):
-        o, a, r, o2, d, _ = batch
+        # Unpack batch
+        previous_obs, actions, rewards, new_obs, terminated, truncated = batch
 
-        arrays = [
-            np.array([0, 0, 0]),
-            np.array([0, 0, -1]),
-            np.array([0, 0, 1]),
-            np.array([0, 1, 0]),
-            np.array([0, 1, -1]),
-            np.array([0, 1, 1]),
-            np.array([1, 0, 0]),
-            np.array([1, 0, -1]),
-            np.array([1, 0, 1]),
-            np.array([1, 1, 0]),
-            np.array([1, 1, -1]),
-            np.array([1, 1, 1])
-        ]
+        action_indices = self._get_action_indices(actions)
 
-        arrays_np = np.array(arrays, dtype=np.float32)
-
-        arrays_tensor = torch.tensor(arrays_np).to(device=self.device)
-
-        a_i = self._batched_find_nearest_array_indices(a, arrays_tensor, batch_size=self.batch_size)
-
-        _, log_pi = self.model.actor(o)
-
-        log_pi_a = log_pi[range(self.batch_size), a_i[:]]
-
-        _, tlog_pi = self.model_target.actor(o)
-
-        tlog_pi_a = tlog_pi[range(self.batch_size), a_i[:]]
+        # Calculate current state probabilities
+        action_probs, log_ps = self.model.actor(previous_obs, log=True)
+        log_ps_a = log_ps[range(self.batch_size), action_indices]
 
         with torch.no_grad():
-            pns, _ = self.model.actor(o2)
+            # Calculate nth next state probabilities
+            pns, _ = self.model.actor(new_obs)
             dns = self.support.expand_as(pns) * pns
-            summed = dns.sum(2)
-
-            argmax_indices_a = torch.argmax(summed[:], dim=1)
-
+            argmax_indices_ns = dns.sum(2).argmax(1)
             self.model_target.reset_noise()
-            pns, _ = self.model_target.actor(o2)
-            pns_a = pns[range(self.batch_size), argmax_indices_a]
+            pns, _ = self.model_target.actor(new_obs)
+            pns_a = pns[range(self.batch_size), argmax_indices_ns]
 
-            discount = 0.99
-            n = 0
-
-            nonterminals = (d == 0).to(torch.float32).to(device=self.device)
-
-            discount_factor = discount ** n
-            discounted_values = nonterminals.float() * discount_factor
-
-            expand_r = r.unsqueeze(1)
-            expand_support = self.support.unsqueeze(0)
-
-            Tz = expand_r + discounted_values.unsqueeze(1) * expand_support
-
+            # Compute Tz (Bellman operator T applied to z)
+            # TODO: figure out self.n
+            Tz = rewards.unsqueeze(1) + terminated.unsqueeze(1) * (self.gamma ** self.n) * self.support.unsqueeze(0)
+            Tz_unclamped = torch.clone(Tz)
             Tz = Tz.clamp(min=self.V_min, max=self.V_max)
 
+            if not torch.equal(Tz, Tz_unclamped):
+                print('Tz clamped!')
+
+            # Compute L2 project of Tz onto fixed support z
             b = (Tz - self.V_min) / self.delta_z
             l, u = b.floor().to(torch.int64), b.ceil().to(torch.int64)
 
-            l[(u > 0) * (l == u)] -= 1
+            # Fix disappearing probability mass when l = b = u (b is int)
+            l[(u > 0) * (l == u)] = -1
             u[(l < (self.atoms - 1)) * (l == u)] += 1
 
-            m = torch.zeros(self.batch_size, self.atoms, device=self.device, dtype=o[1].dtype)
+            # Distribute probability of Tz
+            m = previous_obs[0].new_zeros(self.batch_size, self.atoms)
             offset = torch.linspace(0, ((self.batch_size - 1) * self.atoms), self.batch_size).unsqueeze(1).expand(
-                self.batch_size, self.atoms).to(device=self.device)
+                self.batch_size, self.atoms).to(actions)
+            m.view(-1).index_add_(0, (l + offset).view(-1),
+                                  (pns_a * (u.float() - b)).view(-1))  # m_l = m_l + p(s_t+n, a*)(u - b)
+            m.view(-1).index_add_(0, (u + offset).view(-1),
+                                  (pns_a * (b - l.float())).view(-1))  # m_u = m_u + p(s_t+n, a*)(b - l)
 
-            def update_tensor_with_indices(tensor, indices, values):
-                # Flatten the tensor to apply index_add_
-                flat_tensor = tensor.view(-1)
-                # Convert indices to int64 dtype
-                indices = indices.view(-1).to(torch.int64)
-                # Perform index_add_ operation
-                flat_tensor.index_add_(0, indices, values.view(-1))
-
-            update_tensor_with_indices(m, (l + offset), (pns_a * (u.float() - b)))
-            update_tensor_with_indices(m, (u + offset), (pns_a * (b - l.float())))
-
-        loss = (-torch.sum(m * log_pi_a, 1))
-        tloss = (-torch.sum(m * tlog_pi_a, 1))
-
+        loss = -torch.sum(m * log_ps_a, 1)  # Cross-entropy loss (minimises DKL(m||p(s_t, a_t)))
         self.model.actor.zero_grad()
-        loss.mean().backward()
 
-        norm_clip = 10
-        clip_grad_norm_(self.model.actor.parameters(), norm_clip)
+        # TODO: figure out weights
+        loss.mean().backward()
+        # (weights * loss).mean().backward()  # Backpropagate importance-weighted minibatch loss
+        clip_grad_norm_(self.model.actor.parameters(), self.norm_clip)  # Clip gradients by L2 norm
         self.optimizer.step()
 
-        self.iter += 1
-        if (self.iter % 1000) == 0:
-            # update target
-            self.model_target.actor.load_state_dict(self.model.actor.state_dict())
-            self.iter = 0
+        # TODO: figure out priorities
+        # mem.update_priorities(idxs, loss.detach().cpu().numpy())  # Update priorities of sampled transitions
 
         ret_dict = dict(
             loss_actor=loss.mean().item(),
-            loss_critic=tloss.mean().item(),
+            loss_critic=0,
         )
 
         return ret_dict
 
-    def _batched_find_nearest_array_indices(self, input_tensor, arrays_tensor, batch_size=256):
-        num_input = input_tensor.shape[0]
-        nearest_indices = []
-
-        with torch.no_grad():
-            for start in range(0, num_input, batch_size):
-                end = min(start + batch_size, num_input)
-                batch_input = input_tensor[start:end]
-
-                # Compute squared distances using broadcasting
-                distances = torch.sum((arrays_tensor.unsqueeze(0) - batch_input.unsqueeze(1)) ** 2, dim=2)
-
-                # Find nearest indices for each element in the batch
-                batch_nearest_indices = torch.argmin(distances, dim=1)
-                nearest_indices.append(batch_nearest_indices)
-
-        # Concatenate all nearest indices from batches
-        return torch.cat(nearest_indices)
+    def _get_action_indices(self, actions: Tensor) -> Tensor:
+        diff = actions.unsqueeze(1) - params.possible_actions_tensor_trainer
+        distances = torch.norm(diff, dim=2)
+        indices = torch.argmin(distances, dim=1)
+        return indices
 
 
 training_agent_cls = partial(RAINTrainingAgent,
