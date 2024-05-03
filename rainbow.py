@@ -297,7 +297,7 @@ class RAINTrainingAgent(TrainingAgent):
 
         self.iter = 0
         self.batch_size = params.batch_size
-        self.norm_clip = 10
+        self.norm_clip = 10000
 
         # TODO: figure out what this should be
         self.n = 1
@@ -396,9 +396,8 @@ class RAINTrainingAgent(TrainingAgent):
 
             loss_t = -torch.sum(m * log_ps_a_t, 1)
             # assert loss_t.shape == (self.batch_size,), f"Unexpected shape of loss_t:{loss_t.shape}, expected {(self.batch_size,)}"
-            loss_t=loss_t[torch.isfinite(loss_t)]
+            # loss_t=loss_t[torch.isfinite(loss_t)]
             # assert torch.all(torch.isfinite(loss_t)), f"loss_t contains non-finite values:{loss_t}"
-            loss_mean_cpu_t = loss_t.cpu().mean()
 
 
         
@@ -407,15 +406,14 @@ class RAINTrainingAgent(TrainingAgent):
 
         loss = -torch.sum(m * log_ps_a, 1)  # Cross-entropy loss (minimises DKL(m||p(s_t, a_t)))
         # assert loss.shape == (self.batch_size,), f"Unexpected shape of loss:{loss.shape}"
-        loss=loss[torch.isfinite(loss)]
+        # loss=loss[torch.isfinite(loss)]
         # assert torch.all(torch.isfinite(loss)), f"loss contains non-finite values:{loss}"
 
         self.model.actor.zero_grad()
 
         # TODO: figure out weights
-        loss_mean_cpu = loss.cpu().mean()
 
-        loss_mean_cpu.backward()
+        loss.mean().backward()
         # (weights * loss).mean().backward()  # Backpropagate importance-weighted minibatch loss
         clip_grad_norm_(self.model.actor.parameters(), self.norm_clip)  # Clip gradients by L2 norm
         self.optimizer.step()
@@ -425,8 +423,8 @@ class RAINTrainingAgent(TrainingAgent):
 
         with torch.no_grad():
             ret_dict = dict(
-                loss_actor=loss_mean_cpu.item(),
-                loss_critic=loss_mean_cpu_t.item(),
+                loss_actor=loss.mean().item(),
+                loss_critic=loss_t.mean().item(),
             )
         del loss
         
