@@ -75,19 +75,23 @@ class ConfigParameters:
         self.imgs_buf_len = cfg.IMG_HIST_LEN
         self.act_buf_len = cfg.ACT_BUF_LEN
 
-        # Custom stuff
+        # # Custom stuff
+        # self.possible_actions = np.array(
+        #     [np.array([0, 0, 0]), np.array([0, 0, -1]), np.array([0, 0, 1]), np.array([0, 1, 0]),
+        #      np.array([0, 1, -1]), np.array([0, 1, 1]), np.array([1, 0, 0]), np.array([1, 0, -1]),
+        #      np.array([1, 0, 1]), np.array([1, 1, 0]), np.array([1, 1, -1]), np.array([1, 1, 1])])
+        
         self.possible_actions = np.array(
-            [np.array([0, 0, 0]), np.array([0, 0, -1]), np.array([0, 0, 1]), np.array([0, 1, 0]),
-             np.array([0, 1, -1]), np.array([0, 1, 1]), np.array([1, 0, 0]), np.array([1, 0, -1]),
-             np.array([1, 0, 1]), np.array([1, 1, 0]), np.array([1, 1, -1]), np.array([1, 1, 1])])
+            [np.array([0, 0, 0]), np.array([0, 0, -1]), np.array([0, 0, 1]), np.array([1, 0, 0]), np.array([1, 0, -1]),
+             np.array([1, 0, 1])])
 
         self.possible_actions_tensor_trainer = torch.tensor(self.possible_actions, dtype=torch.float32).to(
             device=self.device_trainer)
         self.possible_actions_tensor_worker = torch.tensor(self.possible_actions, dtype=torch.float32).to(
             device=self.device_worker)
 
-        self.V_MIN = -5
-        self.V_MAX = 5
+        self.V_MIN = -5000
+        self.V_MAX = 5000
         self.atoms = 500
 
 
@@ -176,7 +180,7 @@ class RainbowActorModule(TorchActorModule):
         self.device = params.device_worker
 
         # TODO: make this a parameter
-        self.atoms = atoms
+        self.atoms = params.atoms
         self.epsilon = 1e-3
 
         self.action_space = action_space
@@ -309,13 +313,19 @@ class RAINTrainingAgent(TrainingAgent):
         # Unpack batch
         previous_obs, actions, rewards, new_obs, terminated, truncated = batch
 
+        rewards*=1000
+
         action_indices = self._get_action_indices(actions)
 
         # Calculate current state probabilities
         action_probs, log_ps = self.model.actor(previous_obs, log=True)
         log_ps_a = log_ps[range(self.batch_size), action_indices]
 
+
         with torch.no_grad():
+            action_probs_t, log_ps_t = self.model_target.actor(previous_obs, log=True)
+            log_ps_a_t = log_ps_t[range(self.batch_size), action_indices]
+
             # Calculate nth next state probabilities
             pns, _ = self.model.actor(new_obs)
             dns = self.support.expand_as(pns) * pns
@@ -326,31 +336,86 @@ class RAINTrainingAgent(TrainingAgent):
 
             # Compute Tz (Bellman operator T applied to z)
             # TODO: figure out self.n
-            Tz = rewards.unsqueeze(1) + terminated.unsqueeze(1) * (self.gamma ** self.n) * self.support.unsqueeze(0)
+            
+            nonterminals = (terminated == 0).to(torch.float32).to(device=self.device)
+            
+            Tz = rewards.unsqueeze(1) + nonterminals.unsqueeze(1) * (self.gamma ** self.n) * self.support.unsqueeze(0)
             Tz = Tz.clamp(min=self.V_min, max=self.V_max)
 
             # Compute L2 project of Tz onto fixed support z
             b = (Tz - self.V_min) / self.delta_z
             l, u = b.floor().to(torch.int64), b.ceil().to(torch.int64)
+            # print("bounds")
+            # print(b)
+            # print(l,u)
 
             # Fix disappearing probability mass when l = b = u (b is int)
-            l[(u > 0) * (l == u)] = -1
+            l[(u > 0) * (l == u)] -= 1
             u[(l < (self.atoms - 1)) * (l == u)] += 1
 
-            # Distribute probability of Tz
-            m = previous_obs[0].new_zeros(self.batch_size, self.atoms)
-            offset = torch.linspace(0, ((self.batch_size - 1) * self.atoms), self.batch_size).unsqueeze(1).expand(
-                self.batch_size, self.atoms).to(actions)
-            m.view(-1).index_add_(0, (l + offset).view(-1),
-                                  (pns_a * (u.float() - b)).view(-1))  # m_l = m_l + p(s_t+n, a*)(u - b)
-            m.view(-1).index_add_(0, (u + offset).view(-1),
-                                  (pns_a * (b - l.float())).view(-1))  # m_u = m_u + p(s_t+n, a*)(b - l)
+            
+            # print(l,u)
+
+            # # Distribute probability of Tz
+            # m = previous_obs[0].new_zeros(self.batch_size, self.atoms)
+            # offset = torch.linspace(0, ((self.batch_size - 1) * self.atoms), self.batch_size).unsqueeze(1).expand(
+            #     self.batch_size, self.atoms).to(actions)
+            # m.view(-1).index_add_(0, (l + offset).view(-1),
+            #                       (pns_a * (u.float() - b)).view(-1))  # m_l = m_l + p(s_t+n, a*)(u - b)
+            # m.view(-1).index_add_(0, (u + offset).view(-1),
+            #                       (pns_a * (b - l.float())).view(-1))  # m_u = m_u + p(s_t+n, a*)(b - l)
+
+            m = torch.zeros(self.batch_size, self.atoms, device=self.device, dtype = previous_obs[1].dtype)
+            offset = torch.linspace(0, ((self.batch_size - 1) * self.atoms), self.batch_size).unsqueeze(1).expand(self.batch_size, self.atoms).to(device=self.device)
+
+            # assert torch.all(torch.isfinite(m)), f"m contains non-finite values:{m}"
+            # Helper function to perform index_add_ operation
+            def update_tensor_with_indices(tensor, indices, values):
+                # Flatten the tensor to apply index_add_
+                # assert torch.all(torch.isfinite(tensor.view(-1))), f"flat_tensor contains non-finite values:{tensor.view(-1)}"
+                # Convert indices to int64 dtype
+                indices = indices.view(-1).to(torch.int64)
+                 # Non-negative values
+                # assert torch.all(indices >= 0), f"Indices must be non-negative:{indices}"
+                # assert torch.all(indices < len(tensor.view(-1))), f"Indices must be valid:{indices}, should be <{len(tensor.view(-1))}"
+                # assert torch.all(torch.isfinite(indices)), f"indices contains non-finite values:{indices}"
+                # Perform index_add_ operation
+                tensor.view(-1).index_add_(0, indices, values.view(-1))
+                # assert torch.all(torch.isfinite(tensor.view(-1))), f"flat_tensor contains non-finite values:{tensor.view(-1)}"
+
+            update_tensor_with_indices(m, (l + offset), (pns_a * (u.float() - b)))
+            # assert torch.all(torch.isfinite(m)), f"m contains non-finite values:{m}"
+            update_tensor_with_indices(m, (u + offset), (pns_a * (b - l.float())))
+            # assert torch.all(torch.isfinite(m)), f"m contains non-finite values:{m}"
+            
+            
+            # assert m.shape == (self.batch_size,self.atoms), f"Unexpected shape of m:{m.shape}, expected {(self.batch_size,self.atoms)}"
+            # assert torch.all(torch.isfinite(m)), f"m contains non-finite values:{m}"
+            # assert log_ps_a_t.shape == (self.batch_size,self.atoms), f"Unexpected shape of log_ps_a_t:{log_ps_a_t.shape}, expected {(self.batch_size,self.atoms)}"
+            # assert torch.all(torch.isfinite(log_ps_a_t)), f"log_ps_a_t contains non-finite values:{log_ps_a_t}"
+
+            loss_t = -torch.sum(m * log_ps_a_t, 1)
+            # assert loss_t.shape == (self.batch_size,), f"Unexpected shape of loss_t:{loss_t.shape}, expected {(self.batch_size,)}"
+            loss_t=loss_t[torch.isfinite(loss_t)]
+            # assert torch.all(torch.isfinite(loss_t)), f"loss_t contains non-finite values:{loss_t}"
+            loss_mean_cpu_t = loss_t.cpu().mean()
+
+
+        
+        # assert log_ps_a.shape == (self.batch_size,self.atoms), f"Unexpected shape of log_ps_a:{log_ps_a.shape}, expected {(self.batch_size,self.atoms)}"
+        # assert torch.all(torch.isfinite(log_ps_a)), f"log_ps_a contains non-finite values:{log_ps_a}"
 
         loss = -torch.sum(m * log_ps_a, 1)  # Cross-entropy loss (minimises DKL(m||p(s_t, a_t)))
+        # assert loss.shape == (self.batch_size,), f"Unexpected shape of loss:{loss.shape}"
+        loss=loss[torch.isfinite(loss)]
+        # assert torch.all(torch.isfinite(loss)), f"loss contains non-finite values:{loss}"
+
         self.model.actor.zero_grad()
 
         # TODO: figure out weights
-        loss.mean().backward()
+        loss_mean_cpu = loss.cpu().mean()
+
+        loss_mean_cpu.backward()
         # (weights * loss).mean().backward()  # Backpropagate importance-weighted minibatch loss
         clip_grad_norm_(self.model.actor.parameters(), self.norm_clip)  # Clip gradients by L2 norm
         self.optimizer.step()
@@ -358,10 +423,18 @@ class RAINTrainingAgent(TrainingAgent):
         # TODO: figure out priorities
         # mem.update_priorities(idxs, loss.detach().cpu().numpy())  # Update priorities of sampled transitions
 
-        ret_dict = dict(
-            loss_actor=loss.mean().item(),
-            loss_critic=0,
-        )
+        with torch.no_grad():
+            ret_dict = dict(
+                loss_actor=loss_mean_cpu.item(),
+                loss_critic=loss_mean_cpu_t.item(),
+            )
+        del loss
+        
+        self.iter+=1
+        if((self.iter%1000)==0):
+            #update target
+            self.model_target.actor.load_state_dict(self.model.actor.state_dict())
+            self.iter=0
 
         return ret_dict
 
